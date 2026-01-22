@@ -1,7 +1,7 @@
-FROM ubuntu:24.04 AS install
+FROM ubuntu:20.04 AS install
 
 RUN apt update \
-    && apt install -y build-essential \
+    && DEBIAN_FRONTEND=noninteractive apt install -y build-essential \
     git \
     cmake cmake-curses-gui libflann-dev \
     libgsl-dev libeigen3-dev libopenmpi-dev \
@@ -13,33 +13,29 @@ RUN apt update \
     libembree-dev \
     libgdal-dev
 
-# missing:
-# libvtk7-dev       ->  libvtk9-dev
-# libvtk7-qt-dev    ->  libvtk9-qt-dev
-# qt5-default       -> qt6-base-dev?
-
 RUN git clone https://github.com/uos/lvr2.git
 RUN mkdir lvr2/build \
     && cd lvr2/build \
     && cmake .. \
     && make -j
 
-FROM ubuntu:24.04 AS binary
+FROM ubuntu:20.04 AS binary
 WORKDIR /lvr2
 
 RUN apt update \
-    && apt install -y \
-    libboost-program-options1.83.0 \
-    libboost-filesystem1.83.0 \
-    libboost-iostreams1.83.0 \
-    libembree4-4 \
+    && DEBIAN_FRONTEND=noninteractive apt install -y \
+    libboost-program-options1.71.0 \
+    libboost-filesystem1.71.0 \
+    libboost-iostreams1.71.0 \
+    libembree3-3 \
     libglu1 \
     libgomp1 \
     libgslcblas0 \
     libhdf5-dev \
-    libopencv-imgcodecs406t64 \
-    libopencv-features2d406t64 \
-    libyaml-cpp0.8
+    libopencv-imgcodecs4.2 \
+    libopencv-features2d4.2 \
+    libopengl0 \
+    libyaml-cpp0.6
 
 COPY --from=install [ \
     "/lvr2/build/bin/lvr2_hdf5_mesh_tool", \
