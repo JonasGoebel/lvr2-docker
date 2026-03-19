@@ -2,7 +2,7 @@
   "name": "lvr2-docker",
   "build": {
     "context": "..",
-    "dockerfile": "../Dockerfile"
+    "dockerfile": "./Dockerfile"
   },
   "runArgs": [
     "--gpus", "all",
