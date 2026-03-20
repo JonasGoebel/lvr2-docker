@@ -1,0 +1,18 @@
+services:
+  lvr:
+    container_name: lvr
+    command: sleep 99999999
+    build:
+      context: .
+      dockerfile: 24_04/Cesium.Dockerfile
+    volumes:
+      - ./data:/lvr2/data
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1 # alternatively, use `count: all` for all GPUs
+              capabilities: [gpu]
+
