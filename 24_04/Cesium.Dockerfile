@@ -1,4 +1,9 @@
 ##############################################################################
+# Stage 0: PDAL (sourced from the official pdal/pdal image)
+##############################################################################
+FROM pdal/pdal:latest AS pdal
+
+##############################################################################
 # Stage 1: build
 ##############################################################################
 FROM ubuntu:24.04 AS build
@@ -323,3 +328,14 @@ COPY --from=build /lvr2/build/lib/ /lvr2/lib/
 
 # Make the lvr2 shared libraries findable at runtime
 ENV LD_LIBRARY_PATH=/lvr2/lib:$LD_LIBRARY_PATH
+
+# --- PDAL (copied from official pdal/pdal image) ----------------------------
+# The pdal binary and all its conda-bundled shared libraries are self-contained
+# under /opt/conda/envs/pdal in the source image.  We copy them verbatim so
+# that no additional apt packages are needed.
+COPY --from=pdal /opt/conda/envs/pdal/bin/pdal      /opt/pdal/bin/pdal
+COPY --from=pdal /opt/conda/envs/pdal/bin/pdal-config /opt/pdal/bin/pdal-config
+COPY --from=pdal /opt/conda/envs/pdal/lib/          /opt/pdal/lib/
+
+ENV PATH=/opt/pdal/bin:$PATH
+ENV LD_LIBRARY_PATH=/opt/pdal/lib:$LD_LIBRARY_PATH
