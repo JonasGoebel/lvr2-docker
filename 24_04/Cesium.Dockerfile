@@ -232,6 +232,416 @@ path.write_text(text.replace(old, new, 1))
 print('Patch 7 applied: added strip-spdlog step to cesium-native ExternalProject')
 PYEOF
 
+# Patch 8 (include/lvr2/algorithm/Tesselator.tcc):
+#   The main tessellation loop iterates over `clusters` (a ClusterBiMap backed
+#   by a StableVector) while addTesselatedFaces() both removes and re-creates
+#   a cluster on every iteration.  StableVectorIterator stores a raw pointer to
+#   the underlying std::vector; its operator++ checks `m_pos < m_elements->size()`
+#   (a LIVE read) while the end() sentinel has m_pos fixed at the original size N.
+#   Each createCluster() appends to the vector, growing m_elements->size() to
+#   N+1, N+2, … so the loop iterator keeps advancing past the original end,
+#   visiting every freshly-appended cluster and re-processing it forever.
+#
+#   Fix: snapshot all ClusterHandles into a std::vector<ClusterHandle> before
+#   the loop and iterate over that fixed-size snapshot instead.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+path = pathlib.Path('/lvr2/include/lvr2/algorithm/Tesselator.tcc')
+text = path.read_text()
+
+old = (
+    '    init();\n'
+    '\n'
+    '    for (auto clusterH: clusters)\n'
+    '    {'
+)
+new = (
+    '    init();\n'
+    '\n'
+    '    // Patch 8: snapshot handles before iterating — addTesselatedFaces()\n'
+    '    // calls clusters.removeCluster() + clusters.createCluster() on every\n'
+    '    // iteration which appends to the underlying StableVector and causes the\n'
+    '    // range-for end-sentinel to be passed, resulting in an infinite loop.\n'
+    '    std::vector<ClusterHandle> clusterSnapshot;\n'
+    '    for (auto clH : clusters) { clusterSnapshot.push_back(clH); }\n'
+    '\n'
+    '    for (auto clusterH: clusterSnapshot)\n'
+    '    {'
+)
+assert old in text, 'Patch 8: expected loop preamble not found in Tesselator.tcc'
+path.write_text(text.replace(old, new, 1))
+print('Patch 8 applied: Tesselator infinite-loop fix')
+PYEOF
+
+# Patch 9 (include/lvr2/algorithm/ContourAlgorithms.tcc):
+#   walkContour uses std::find to locate currEdgeH in edgesOfVertex and stores
+#   the result in ourPos.  If the edge is not found (which can happen when the
+#   mesh topology is invalidated by a prior addTesselatedFaces call), std::find
+#   returns end(), making ourPos == edgesOfVertex.size().  The inner while(true)
+#   loop then starts afterPos at edgesOfVertex.size() and advances via modular
+#   arithmetic (afterPos = (afterPos+1) % size).  Because size % size == 0 and
+#   the cycle is 1,2,…,size-1,0,1,… it never reaches the stale ourPos value of
+#   `size`, so the panic guard is never triggered and the loop spins forever.
+#
+#   Fix: check that ourPos is within bounds immediately after std::find and
+#   panic early with a clear, actionable message if the edge is absent.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+path = pathlib.Path('/lvr2/include/lvr2/algorithm/ContourAlgorithms.tcc')
+text = path.read_text()
+
+old = (
+    '        const auto ourPos = std::find(edgesOfVertex.begin(), edgesOfVertex.end(), currEdgeH) - edgesOfVertex.begin();\n'
+    '        auto afterPos = ourPos;\n'
+    '        while(true)\n'
+    '        {'
+)
+new = (
+    '        const auto ourPos = std::find(edgesOfVertex.begin(), edgesOfVertex.end(), currEdgeH) - edgesOfVertex.begin();\n'
+    '        // Patch 9: guard against a stale/invalidated edge handle.  If\n'
+    '        // currEdgeH is absent from edgesOfVertex, std::find returns end(),\n'
+    '        // making ourPos == edgesOfVertex.size().  The modular-arithmetic\n'
+    '        // loop below would then spin forever because (size % size)==0 and\n'
+    '        // afterPos cycles through 1…size-1,0 without ever equalling size.\n'
+    '        if (static_cast<size_t>(ourPos) >= edgesOfVertex.size())\n'
+    '        {\n'
+    '            panic(\n'
+    '                "walkContour: currEdge not found among edges of nextVertex — "\n'
+    '                "mesh topology is inconsistent (edge handle may be stale after "\n'
+    '                "a prior retesselation step)"\n'
+    '            );\n'
+    '        }\n'
+    '        auto afterPos = ourPos;\n'
+    '        while(true)\n'
+    '        {'
+)
+assert old in text, 'Patch 9: expected walkContour block not found in ContourAlgorithms.tcc'
+path.write_text(text.replace(old, new, 1))
+print('Patch 9 applied: walkContour infinite-spin guard')
+PYEOF
+
+# Patch 10 (include/lvr2/algorithm/ClusterAlgorithms.tcc):
+#   optimizePlaneIntersections() iterates over ALL pairs of planes with an
+#   O(N^2) double loop (N = number of plane clusters).  For large outdoor
+#   meshes N easily reaches tens of thousands, making the loop run for hours
+#   while the progress bar is stuck at 0%.
+#
+#   Root cause: two planes only need to be reconciled along their shared
+#   boundary edge.  The original code checks every possible pair regardless
+#   of spatial adjacency, so the vast majority of iterations do no useful
+#   work (dragOntoIntersection finds no shared edges and returns immediately)
+#   yet still pays the full O(faces_in_cluster) scan cost per call.
+#
+#   Fix: pre-build the set of adjacent cluster pairs in O(F) time (F = total
+#   mesh faces) by walking each face's edges and noting when a neighbouring
+#   face belongs to a different plane cluster.  The inner double loop is then
+#   replaced by a single pass over this much smaller adjacency set.
+#
+#   Each pair (a, b) with a.idx() <= b.idx() is encoded as a single uint64_t
+#   (a.idx() << 32 | b.idx()) for cheap de-duplication via unordered_set
+#   without requiring a custom pair hash.  <unordered_set> is already
+#   included by ClusterAlgorithms.tcc so no additional header is needed.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+path = pathlib.Path('/lvr2/include/lvr2/algorithm/ClusterAlgorithms.tcc')
+text = path.read_text()
+
+old = (
+    'template<typename BaseVecT>\n'
+    'void optimizePlaneIntersections(\n'
+    '    BaseMesh<BaseVecT>& mesh,\n'
+    '    const ClusterBiMap<FaceHandle>& clusters,\n'
+    '    const ClusterMap<Plane<BaseVecT>>& planes\n'
+    ')\n'
+    '{\n'
+    '    // Status message for mesh generation\n'
+    '    string comment = timestamp.getElapsedTime() + "Optimizing plane intersections ";\n'
+    '    ProgressBar progress(planes.numValues(), comment);\n'
+    '\n'
+    '    // iterate over all planes\n'
+    '    for (auto it = planes.begin(); it != planes.end(); ++it)\n'
+    '    {\n'
+    '        auto clusterH = *it;\n'
+    '\n'
+    '        // only iterate over distinct pairs of planes, e.g. the following planes of the current one\n'
+    '        auto itInner = it;\n'
+    '        ++itInner;\n'
+    '        for (; itInner != planes.end(); ++itInner)\n'
+    '        {\n'
+    '            auto clusterInnerH = *itInner;\n'
+    '\n'
+    '            auto& plane1 = planes[clusterH];\n'
+    '            auto& plane2 = planes[clusterInnerH];\n'
+    '\n'
+    '            // do not improve almost parallel cluster\n'
+    '            float normalDot = plane1.normal.dot(plane2.normal);\n'
+    '            if (fabs(normalDot) < 0.9)\n'
+    '            {\n'
+    '                auto intersection = plane1.intersect(plane2);\n'
+    '\n'
+    '                dragOntoIntersection(mesh, clusters, clusterH, clusterInnerH, intersection);\n'
+    '                dragOntoIntersection(mesh, clusters, clusterInnerH, clusterH, intersection);\n'
+    '            }\n'
+    '        }\n'
+    '\n'
+    '        ++progress;\n'
+    '    }\n'
+    '\n'
+    '    if(!timestamp.isQuiet())\n'
+    '        std::cout << std::endl;\n'
+    '}'
+)
+
+new = (
+    'template<typename BaseVecT>\n'
+    'void optimizePlaneIntersections(\n'
+    '    BaseMesh<BaseVecT>& mesh,\n'
+    '    const ClusterBiMap<FaceHandle>& clusters,\n'
+    '    const ClusterMap<Plane<BaseVecT>>& planes\n'
+    ')\n'
+    '{\n'
+    '    // Patch 10: The original O(N^2) all-pairs loop over planes is unacceptably\n'
+    '    // slow for large meshes (N = number of plane clusters; even N=1000 results\n'
+    '    // in 500 k iterations, each doing a full face-edge scan).  Two planes only\n'
+    '    // need to be reconciled when they actually share a boundary edge.  We first\n'
+    '    // build the set of such adjacent pairs in O(F) time (F = mesh faces), then\n'
+    '    // iterate over that much smaller set instead of the full Cartesian product.\n'
+    '    //\n'
+    '    // Encoding: a pair (a, b) with a.idx() <= b.idx() is stored as a single\n'
+    '    // uint64_t value (a.idx() << 32 | b.idx()), which allows efficient\n'
+    '    // de-duplication via an unordered_set without needing a custom pair hash.\n'
+    '\n'
+    '    std::unordered_set<uint64_t> adjSet;\n'
+    '    for (auto clusterH : clusters)\n'
+    '    {\n'
+    '        if (!planes.containsKey(clusterH))\n'
+    '            continue;\n'
+    '        for (auto faceH : clusters[clusterH].handles)\n'
+    '        {\n'
+    '            for (auto edgeH : mesh.getEdgesOfFace(faceH))\n'
+    '            {\n'
+    '                auto adjFaces = mesh.getFacesOfEdge(edgeH);\n'
+    '                for (auto& optF : adjFaces)\n'
+    '                {\n'
+    '                    if (!optF)\n'
+    '                        continue;\n'
+    '                    auto optN = clusters.getClusterOf(optF.unwrap());\n'
+    '                    if (!optN)\n'
+    '                        continue;\n'
+    '                    auto nch = optN.unwrap();\n'
+    '                    if (nch == clusterH || !planes.containsKey(nch))\n'
+    '                        continue;\n'
+    '                    uint64_t ai = clusterH.idx();\n'
+    '                    uint64_t bi = nch.idx();\n'
+    '                    if (ai > bi) std::swap(ai, bi);\n'
+    '                    adjSet.insert((ai << 32) | bi);\n'
+    '                }\n'
+    '            }\n'
+    '        }\n'
+    '    }\n'
+    '\n'
+    '    // Status message for mesh generation\n'
+    '    string comment = timestamp.getElapsedTime() + "Optimizing plane intersections ";\n'
+    '    ProgressBar progress(adjSet.size(), comment);\n'
+    '\n'
+    '    for (uint64_t encoded : adjSet)\n'
+    '    {\n'
+    '        ClusterHandle c1(static_cast<uint32_t>(encoded >> 32));\n'
+    '        ClusterHandle c2(static_cast<uint32_t>(encoded & 0xFFFFFFFFULL));\n'
+    '\n'
+    '        auto& plane1 = planes[c1];\n'
+    '        auto& plane2 = planes[c2];\n'
+    '\n'
+    '        // do not improve almost parallel cluster\n'
+    '        float normalDot = plane1.normal.dot(plane2.normal);\n'
+    '        if (fabs(normalDot) < 0.9)\n'
+    '        {\n'
+    '            auto intersection = plane1.intersect(plane2);\n'
+    '\n'
+    '            dragOntoIntersection(mesh, clusters, c1, c2, intersection);\n'
+    '            dragOntoIntersection(mesh, clusters, c2, c1, intersection);\n'
+    '        }\n'
+    '\n'
+    '        ++progress;\n'
+    '    }\n'
+    '\n'
+    '    if(!timestamp.isQuiet())\n'
+    '        std::cout << std::endl;\n'
+    '}'
+)
+
+assert old in text, 'Patch 10: optimizePlaneIntersections body not found in ClusterAlgorithms.tcc'
+path.write_text(text.replace(old, new, 1))
+print('Patch 10 applied: optimizePlaneIntersections adjacency-set fix')
+PYEOF
+
+# Patch 11 (include/lvr2/algorithm/ClusterAlgorithms.tcc):
+#   findContours() has three performance bugs that together cause the
+#   "Tesselating clusters 0%" stall on large meshes:
+#
+#   Bug A: `auto cluster = clusters[clusterH]` copies the Cluster<FaceHandle>
+#   struct (including its vector<FaceHandle>) by value on every call.
+#   Fix: use `const auto& cluster` to bind by const reference.
+#
+#   Bug B: DenseVertexMap<bool> boundaryVertices with a default value lazily
+#   fills the backing StableVector up to key.idx() on every first access via
+#   operator[], costing O(max_vertex_idx) per call.  For a mesh with ~10M
+#   vertices and millions of clusters this is O(N_clusters * max_vertex_idx).
+#   Fix: replace with std::unordered_set<VertexHandle> (O(1) per access).
+#
+#   Bug C: the lambda `[clusters, clusterH]` captures the entire ClusterBiMap
+#   BY VALUE — deep-copying the internal StableVector<ClusterHandle,
+#   Cluster<FaceHandle>> (which itself contains one vector<FaceHandle> per
+#   cluster) every time a new contour walk starts.  With millions of clusters
+#   each having grown entries, this is O(N_clusters^2) in total copies.
+#   Fix: capture clusters by reference: [&clusters, clusterH].
+RUN python3 - <<'PYEOF'
+import pathlib
+
+path = pathlib.Path('/lvr2/include/lvr2/algorithm/ClusterAlgorithms.tcc')
+text = path.read_text()
+
+old = (
+    '    auto cluster = clusters[clusterH];\n'
+    '\n'
+    '    DenseVertexMap<bool> boundaryVertices(cluster.handles.size() * 3, false);\n'
+    '    vector<vector<VertexHandle>> allContours;\n'
+    '    // only used inside edge loop but initialized here to avoid heap allocations\n'
+    '    vector<VertexHandle> contour;\n'
+    '\n'
+    '    for (auto faceH: cluster.handles)\n'
+    '    {\n'
+    '        for (auto edgeH: mesh.getEdgesOfFace(faceH))\n'
+    '        {\n'
+    '            auto faces = mesh.getFacesOfEdge(edgeH);\n'
+    '            if (faces[0] && faces[1])\n'
+    '            {\n'
+    '                auto otherFace = faces[0].unwrap();\n'
+    '\n'
+    '                if (otherFace == faceH)\n'
+    '                {\n'
+    '                    otherFace = faces[1].unwrap();\n'
+    '                }\n'
+    '\n'
+    '                // continue if other face is in same cluster\n'
+    '                if (clusters.getClusterOf(otherFace) &&\n'
+    '                    clusters.getClusterOf(otherFace).unwrap() == clusterH\n'
+    '                    )\n'
+    '                {\n'
+    '                    continue;\n'
+    '                }\n'
+    '            }\n'
+    '\n'
+    '\n'
+    '            auto vertices = mesh.getVerticesOfEdge(edgeH);\n'
+    '\n'
+    '            // edge already in another boundary of this cluster\n'
+    '            if (boundaryVertices[vertices[0]] || boundaryVertices[vertices[1]])\n'
+    '            {\n'
+    '                continue;\n'
+    '            }\n'
+    '\n'
+    '            contour.clear();\n'
+    '            calcContourVertices(mesh, edgeH, contour, [clusters, clusterH](auto fH)\n'
+    '            {\n'
+    '                auto c = clusters.getClusterOf(fH);\n'
+    '\n'
+    '                // return true if current face is in this cluster\n'
+    '                return c && c.unwrap() == clusterH;\n'
+    '            });\n'
+    '\n'
+    '            allContours.push_back(contour);\n'
+    '\n'
+    '            // mark all vertices we got back as visited\n'
+    '            for (auto vertexH: contour)\n'
+    '            {\n'
+    '                boundaryVertices[vertexH] = true;\n'
+    '            }\n'
+    '        }\n'
+    '\n'
+    '    }\n'
+    '\n'
+    '    return allContours;'
+)
+
+new = (
+    '    // Patch 11 fix A: use const ref to avoid copying the cluster\'s face list.\n'
+    '    const auto& cluster = clusters[clusterH];\n'
+    '\n'
+    '    // Patch 11 fix B: use unordered_set instead of DenseVertexMap<bool> to\n'
+    '    // avoid O(max_vertex_idx) fills on every first access to a new vertex.\n'
+    '    std::unordered_set<VertexHandle> boundaryVertices;\n'
+    '    vector<vector<VertexHandle>> allContours;\n'
+    '    // only used inside edge loop but initialized here to avoid heap allocations\n'
+    '    vector<VertexHandle> contour;\n'
+    '\n'
+    '    for (auto faceH: cluster.handles)\n'
+    '    {\n'
+    '        for (auto edgeH: mesh.getEdgesOfFace(faceH))\n'
+    '        {\n'
+    '            auto faces = mesh.getFacesOfEdge(edgeH);\n'
+    '            if (faces[0] && faces[1])\n'
+    '            {\n'
+    '                auto otherFace = faces[0].unwrap();\n'
+    '\n'
+    '                if (otherFace == faceH)\n'
+    '                {\n'
+    '                    otherFace = faces[1].unwrap();\n'
+    '                }\n'
+    '\n'
+    '                // continue if other face is in same cluster\n'
+    '                if (clusters.getClusterOf(otherFace) &&\n'
+    '                    clusters.getClusterOf(otherFace).unwrap() == clusterH\n'
+    '                    )\n'
+    '                {\n'
+    '                    continue;\n'
+    '                }\n'
+    '            }\n'
+    '\n'
+    '\n'
+    '            auto vertices = mesh.getVerticesOfEdge(edgeH);\n'
+    '\n'
+    '            // edge already in another boundary of this cluster\n'
+    '            if (boundaryVertices.count(vertices[0]) || boundaryVertices.count(vertices[1]))\n'
+    '            {\n'
+    '                continue;\n'
+    '            }\n'
+    '\n'
+    '            contour.clear();\n'
+    '            // Patch 11 fix C: capture clusters by reference, not by value.\n'
+    '            // The by-value capture deep-copies the entire ClusterBiMap\n'
+    '            // (including all Cluster<FaceHandle> objects) on every contour\n'
+    '            // walk — O(N_clusters^2) total work on a large mesh.\n'
+    '            calcContourVertices(mesh, edgeH, contour, [&clusters, clusterH](auto fH)\n'
+    '            {\n'
+    '                auto c = clusters.getClusterOf(fH);\n'
+    '\n'
+    '                // return true if current face is in this cluster\n'
+    '                return c && c.unwrap() == clusterH;\n'
+    '            });\n'
+    '\n'
+    '            allContours.push_back(contour);\n'
+    '\n'
+    '            // mark all vertices we got back as visited\n'
+    '            for (auto vertexH: contour)\n'
+    '            {\n'
+    '                boundaryVertices.insert(vertexH);\n'
+    '            }\n'
+    '        }\n'
+    '\n'
+    '    }\n'
+    '\n'
+    '    return allContours;'
+)
+
+assert old in text, 'Patch 11: findContours body not found in ClusterAlgorithms.tcc'
+path.write_text(text.replace(old, new, 1))
+print('Patch 11 applied: findContours const-ref cluster + unordered_set + ref lambda capture')
+PYEOF
+
 # --- Configure --------------------------------------------------------------
 RUN cmake \
     -S /lvr2 \
@@ -245,7 +655,7 @@ RUN cmake \
     -DCMAKE_CUDA_ARCHITECTURES=native
 
 # --- Build ------------------------------------------------------------------
-RUN cmake --build /lvr2/build -- -j$(nproc)
+RUN cmake --build /lvr2/build -- -j 10
 
 ##############################################################################
 # Stage 2: minimal runtime image
