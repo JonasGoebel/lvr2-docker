@@ -62,7 +62,7 @@ RUN curl -fsSL \
 ENV PATH=/usr/local/cuda-12.8/bin:$PATH
 
 # --- Clone lvr2 source ------------------------------------------------------
-RUN git clone https://github.com/uos/lvr2.git /lvr2
+RUN git clone https://github.com/jonasgoebel/lvr2.git /lvr2
 
 # --- Apply patches -----------------------------------------------------------
 #
