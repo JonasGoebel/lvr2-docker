@@ -748,4 +748,4 @@ COPY --from=pdal /opt/conda/envs/pdal/bin/pdal-config /opt/pdal/bin/pdal-config
 COPY --from=pdal /opt/conda/envs/pdal/lib/          /opt/pdal/lib/
 
 ENV PATH=/opt/pdal/bin:$PATH
-ENV LD_LIBRARY_PATH=/opt/pdal/lib:$LD_LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/opt/pdal/lib:/usr/lib/x86_64-linux-gnu/openmpi/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
